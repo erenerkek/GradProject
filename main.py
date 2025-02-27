@@ -1,5 +1,11 @@
+import asyncio
+import json
 import os
+import wmi
 import sys
+import uuid
+import hashlib
+import websockets
 from tkinter.ttk import Sizegrip
 import psutil
 import PySide6
@@ -15,6 +21,102 @@ from time import sleep
 import traceback
 
 from ui_untitled import *
+
+def suspend_process(self, pid):
+    try:
+        p = psutil.Process(pid)
+        p.suspend()
+    except Exception as e:
+        print(f"Suspend hatası: {e}")
+
+def resume_process(self, pid):
+    try:
+        p = psutil.Process(pid)
+        p.resume()
+    except Exception as e:
+        print(f"Resume hatası: {e}")
+
+def terminate_process(self, pid):
+    try:
+        p = psutil.Process(pid)
+        p.terminate()
+    except Exception as e:
+        print(f"Terminate hatası: {e}")
+
+def kill_process(self, pid):
+    try:
+        p = psutil.Process(pid)
+        p.kill()
+    except Exception as e:
+        print(f"Kill hatası: {e}")
+
+def generate_unique_id():
+    mac = uuid.getnode()
+    unique_id = hashlib.md5(str(mac).encode()).hexdigest()[:12]
+    config_file = "device_id.txt"
+    if os.path.exists(config_file):
+        with open(config_file, "r") as f:
+            return f.read()
+    else:
+        with open(config_file, "w") as f:
+            f.write(unique_id)
+async def send_system_info(websocket, path):
+    while True: 
+        processes = []
+        for x in psutil.pids():
+            try:
+                p = psutil.Process(x)
+                processes.append({
+                    'pid': p.pid,
+                    'name': p.name(),
+                    'status': p.status(),
+                    'create_time': datetime.datetime.utcfromtimestamp(p.create_time()).strftime('%Y-%m-%d %H:%M:%S')
+                })
+            except Exception as e:
+                continue
+
+
+        data = {
+            'cpu_count': psutil.cpu_count(),
+            'cpu_main_core': psutil.cpu_count(logical=False),
+            'cpu_percent': psutil.cpu_percent(),
+            'memory_percent': psutil.virtual_memory().percent,
+            'disk_percent': psutil.disk_usage('/').percent,
+            'total_ram': psutil.virtual_memory().total / (1024 ** 3),
+            'used_ram': psutil.virtual_memory().used / (1024 ** 3),
+            'free_ram': psutil.virtual_memory().available / (1024 ** 3),
+            'system_time': datetime.datetime.now().strftime("%I:%M:%S %p"),
+            'system_date': datetime.datetime.now().strftime("%Y-%m-%d"),
+            'machine': platform.machine(),
+            'version': platform.version(),
+            'platform': platform.platform(),
+            'system': platform.system(),
+            'processor': platform.processor(),
+            'battery': psutil.sensors_battery().percent if hasattr(psutil, "sensors_battery") else "Not available",
+            'batt_plugged': psutil.sensors_battery().power_plugged ,
+            'batt_time' : psutil.sensors_battery().secsleft,
+            'processes': processes
+        }
+        await websocket.send(json.dumps(data))
+
+        try:
+            command = await asyncio.wait_for(websocket.recv(), timeout=0.1)
+            command_data = json.loads(command)
+            pid = command_data.get('pid')
+            action = command_data.get('action')
+            if pid and action:
+                p = psutil.Process(pid)
+                if action == "suspend":
+                    p.suspend()
+                elif action == "resume":
+                    p.resume()
+                elif action == "terminate":
+                    p.terminate()
+                elif action == "kill":
+                    p.kill()
+        except asyncio.TimeoutError:
+            pass
+        await asyncio.sleep(1)
 
 platforms = {
     'linux': 'Linux',
@@ -37,6 +139,9 @@ class Worker(QRunnable):
         self.args = args
         self.kwargs = kwargs
         self.signals = WorkerSignals()
+        self.kwargs['process_callback'] = self.signals.progress
+
+        
     @Slot()
     def run(self):
         try:
@@ -99,7 +204,7 @@ class MainWindow(QMainWindow):
 
         self.show()
         #self.battery()
-        self.cpu_ram()
+        #self.cpu_ram()
         self.system_info()
         self.processes()
         self.storage()
@@ -208,6 +313,14 @@ class MainWindow(QMainWindow):
                     progressBar.setObjectName(u"progressBar")
                     progressBar.setValue(temp_per)
                     self.ui.sensorsTable.setCellWidget(rowPosition, 5, progressBar)
+        elif sys.platform == 'win32':
+            w = wmi.WMI()
+            for sensor in w.Win32_TemperatureProbe():
+                rowPosition = self.ui.sensorsTable.rowCount()
+                self.ui.sensorsTable.insertRow(rowPosition)
+
+                self.create_table_widget(rowPosition, 0, "TemperatureProbe", "sensorsTable")
+                self.create_table_widget(rowPosition, 2, str(sensor.CurrentReading), "sensorsTable")
         else:
             global platforms
             rowPosition = self.ui.sensorsTable.rowCount()
@@ -318,7 +431,8 @@ class MainWindow(QMainWindow):
         self.ui.system_processor.setText(platform.processor())
 
 
-    def cpu_ram(self):
+    def cpu_ram(self,process_callback):
+        while True:
             totalRam= 1.0
             totalRam= psutil.virtual_memory()[0]*totalRam
             totalRam= totalRam/(1024*1024*1024)
@@ -373,7 +487,7 @@ class MainWindow(QMainWindow):
             self.ui.ram_percentage.setPathHidden(True)
             self.ui.ram_percentage.setLineCap(('RoundCap','RoundCap','RoundCap'))
             self.ui.ram_percentage.setLineStyle(('SolidLine','SolidLine','SolidLine'))
-            
+            sleep(1)
 
 
 
@@ -395,7 +509,7 @@ class MainWindow(QMainWindow):
         self.animation.setEasingCurve(QEasingCurve.InOutQuart)
         self.animation.start()
 
-    def battery(self, progress_callback):
+    def battery(self, process_callback):
         while True:
             try:
                 if not hasattr(psutil, "sensors_battery"):
@@ -426,7 +540,7 @@ class MainWindow(QMainWindow):
                     self.ui.battery_plugged.setText("Not Plugged In")
 
             # RoundProgressBar ayarları
-                self.ui.battery_usage.setMaximum(100)
+                self.ui.battery_usage.setMaximumValue(100)
                 self.ui.battery_usage.setValue(batt.percent)
                 self.ui.battery_usage.setBarStyle('Donet')
                 self.ui.battery_usage.setLineColor(QColor(51, 187, 232))
@@ -437,10 +551,10 @@ class MainWindow(QMainWindow):
                 self.ui.battery_usage.setLineWidth(15)
                 self.ui.battery_usage.setPathWidth(15)
                 self.ui.battery_usage.setLineCap('RoundCap')
-
+                sleep(1)
             except Exception as e:
                 self.ui.battery_status.setText(f"Error: {str(e)}")
-            sleep(1)
+            
         
             
 
